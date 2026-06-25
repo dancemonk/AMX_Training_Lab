@@ -15,8 +15,15 @@ PROGRAM_NAME='MasterCode'
 (* Removed premature wait 30 / wait 50 polling.     *)
 (* Restored sProjRxBuffer for safe string parsing.  *)
 (* v2.6 - Fixed Disabled Gray Mask Glitch.                 *)
-(* Changed ^ENA-21,0 to ^ENA-21,1 in all states to  *)
-(* allow custom colors to show during transitions.  *)
+(*         Changed ^ENA-21,0 to ^ENA-21,1 in all states to  *)
+(*         allow custom colors to show during transitions.  *)
+(* v2.7 - Improved error handling:                         *)
+(*         Added offline/onerror events for RS-232 port.   *)
+(*         Added comm timeout detection (3 missed polls).  *)
+(*         Added buffer overflow guard with flush.         *)
+(*         Added F (NACK) and unrecognized response handling.*)
+(*         Added power/comm-fault guards on input/controls.*)
+(*         Added touch panel online/offline with UI re-sync.*)
 (***********************************************************)
 
 (***********************************************************)
@@ -68,16 +75,22 @@ volatile integer nSystemPower       // 0=off, 1=on
 volatile integer nProjectorPower    // 0=off, 1=on
 
 volatile long lHeartbeat[] = {30000}   // 30 second heartbeat
+volatile long lCommTimeout[] = {5000}  // 5 second comm timeout
 
 // Buffer for parsing serial RS-232 messages safely
 volatile char sProjRxBuffer[100]
+
+// Communication state tracking
+volatile integer nCommFault         // 1=comm fault active
+volatile integer nAwaitingResponse  // 1=waiting for projector reply
+volatile integer nHeartbeatMisses   // consecutive missed heartbeats
 
 (***********************************************************)
 (* STARTUP CODE                        *)
 (***********************************************************)
 DEFINE_START
 
-send_string 0, "'SYSTEM STARTED v2.6'"
+send_string 0, "'SYSTEM STARTED v2.7'"
 
 // Configure RS-232 port 4
 send_command dvProjector, "'SET BAUD 9600 N 8 1'"
@@ -112,6 +125,9 @@ send_command dvTP, "'^CFT-200,0,2,#E74C3C'"
 // Start heartbeat -- polls projector every 30 seconds
 timeline_create(1, lHeartbeat, 1, TIMELINE_RELATIVE, TIMELINE_REPEAT)
 
+// Comm timeout timeline -- detects missing responses
+timeline_create(2, lCommTimeout, 1, TIMELINE_RELATIVE, TIMELINE_REPEAT)
+
 (***********************************************************)
 (* EVENT HANDLERS                      *)
 (***********************************************************)
@@ -123,7 +139,29 @@ DEFINE_EVENT
 timeline_event[1]
 {
     send_string dvProjector, "'~00124 1', $0D"
+    nAwaitingResponse = 1
+    timeline_set(2, 0)  // Reset comm timeout countdown
     send_string 0, "'Heartbeat - status query sent'"
+}
+
+(* --------------------------------------------------------*)
+(* COMM TIMEOUT -- NO RESPONSE FROM PROJECTOR              *)
+(* --------------------------------------------------------*)
+timeline_event[2]
+{
+    if (nAwaitingResponse)
+    {
+        nHeartbeatMisses = nHeartbeatMisses + 1
+        send_string 0, "'WARNING: Projector did not respond (miss #', itoa(nHeartbeatMisses), ')'"
+
+        if (nHeartbeatMisses >= 3)
+        {
+            nCommFault = 1
+            send_command dvTP, "'^TXT-200,0,COMM FAULT - No Response'"
+            send_command dvTP, "'^CFT-200,0,2,#9B59B6'"
+            send_string 0, "'ERROR: Comm fault -- projector unresponsive after 3 missed heartbeats'"
+        }
+    }
 }
 
 (* --------------------------------------------------------*)
@@ -135,14 +173,50 @@ data_event[dvProjector]
     {
         send_command dvProjector, "'SET BAUD 9600 N 8 1'"
         send_command dvProjector, "'CLEAR_FAULT'"
+        nCommFault = 0
+        nHeartbeatMisses = 0
         send_string 0, "'dvProjector ONLINE -- RS-232 re-initialized'"
         wait 10 { send_string dvProjector, "'~00124 1', $0D" }
+    }
+
+    offline:
+    {
+        nCommFault = 1
+        nHeartbeatMisses = 0
+        send_string 0, "'ERROR: dvProjector OFFLINE -- RS-232 port lost'"
+        send_command dvTP, "'^TXT-200,0,COMM FAULT - Port Offline'"
+        send_command dvTP, "'^CFT-200,0,2,#9B59B6'"
+    }
+
+    onerror:
+    {
+        nCommFault = 1
+        send_string 0, "'ERROR: dvProjector RS-232 fault [', data.text, ']'"
+        send_command dvTP, "'^TXT-200,0,COMM ERROR'"
+        send_command dvTP, "'^CFT-200,0,2,#9B59B6'"
+        send_command dvProjector, "'CLEAR_FAULT'"
     }
 
     string:
     {
         send_string 0, "'RAW: [', data.text, ']'"
-        
+
+        // Clear comm fault on any valid data received
+        nAwaitingResponse = 0
+        nHeartbeatMisses = 0
+        if (nCommFault)
+        {
+            nCommFault = 0
+            send_string 0, "'Comm fault cleared -- data received'"
+        }
+
+        // Guard against buffer overflow
+        if (length_string(sProjRxBuffer) + length_string(data.text) > 100)
+        {
+            send_string 0, "'WARNING: RX buffer overflow -- flushing'"
+            sProjRxBuffer = ''
+        }
+
         // Append raw data into our parsing buffer
         sProjRxBuffer = "sProjRxBuffer, data.text"
         
@@ -278,6 +352,22 @@ data_event[dvProjector]
             else if (find_string(sCurrentMessage, 'P', 1))
             {
                 send_string 0, "'Command accepted (P)'"
+            }
+
+            // --- COMMAND FAILED (F NACK) ---
+            else if (find_string(sCurrentMessage, 'F', 1))
+            {
+                send_string 0, "'ERROR: Command REJECTED by projector (F)'"
+                send_command dvTP, "'^TXT-200,0,Command Failed'"
+                send_command dvTP, "'^CFT-200,0,2,#E74C3C'"
+                // Re-query actual state after failed command
+                wait 10 { send_string dvProjector, "'~00124 1', $0D" }
+            }
+
+            // --- UNRECOGNIZED RESPONSE ---
+            else if (length_string(sCurrentMessage) > 1)
+            {
+                send_string 0, "'WARNING: Unrecognized response [', sCurrentMessage, ']'"
             }
         }
     }
@@ -446,10 +536,17 @@ button_event[dvTP, BTN_INP_HDMI]
 {
     push:
     {
-        send_string dvProjector, "'~0012 5', $0D"
-        on[dvTP,  BTN_INP_HDMI]
-        off[dvTP, BTN_INP_VGA]
-        off[dvTP, BTN_INP_HDMI2]
+        if (nProjectorPower == 1 && nCommFault == 0)
+        {
+            send_string dvProjector, "'~0012 5', $0D"
+            on[dvTP,  BTN_INP_HDMI]
+            off[dvTP, BTN_INP_VGA]
+            off[dvTP, BTN_INP_HDMI2]
+        }
+        else
+        {
+            send_string 0, "'INPUT HDMI1 ignored -- projector not ready or comm fault'"
+        }
     }
 }
 
@@ -457,10 +554,17 @@ button_event[dvTP, BTN_INP_VGA]
 {
     push:
     {
-        send_string dvProjector, "'~0012 1', $0D"
-        off[dvTP, BTN_INP_HDMI]
-        on[dvTP,  BTN_INP_VGA]
-        off[dvTP, BTN_INP_HDMI2]
+        if (nProjectorPower == 1 && nCommFault == 0)
+        {
+            send_string dvProjector, "'~0012 1', $0D"
+            off[dvTP, BTN_INP_HDMI]
+            on[dvTP,  BTN_INP_VGA]
+            off[dvTP, BTN_INP_HDMI2]
+        }
+        else
+        {
+            send_string 0, "'INPUT VGA ignored -- projector not ready or comm fault'"
+        }
     }
 }
 
@@ -468,10 +572,17 @@ button_event[dvTP, BTN_INP_HDMI2]
 {
     push:
     {
-        send_string dvProjector, "'~0012 6', $0D"
-        off[dvTP, BTN_INP_HDMI]
-        off[dvTP, BTN_INP_VGA]
-        on[dvTP,  BTN_INP_HDMI2]
+        if (nProjectorPower == 1 && nCommFault == 0)
+        {
+            send_string dvProjector, "'~0012 6', $0D"
+            off[dvTP, BTN_INP_HDMI]
+            off[dvTP, BTN_INP_VGA]
+            on[dvTP,  BTN_INP_HDMI2]
+        }
+        else
+        {
+            send_string 0, "'INPUT HDMI2 ignored -- projector not ready or comm fault'"
+        }
     }
 }
 
@@ -482,6 +593,12 @@ button_event[dvTP, BTN_PROJ_FREEZE]
 {
     push:
     {
+        if (nProjectorPower == 0 || nCommFault)
+        {
+            send_string 0, "'FREEZE ignored -- projector not ready or comm fault'"
+            return
+        }
+
         if ([dvTP, BTN_PROJ_FREEZE])
         {
             send_string dvProjector, "'~0080 0', $0D"
@@ -502,6 +619,12 @@ button_event[dvTP, BTN_PROJ_BLANK]
 {
     push:
     {
+        if (nProjectorPower == 0 || nCommFault)
+        {
+            send_string 0, "'BLANK ignored -- projector not ready or comm fault'"
+            return
+        }
+
         if ([dvTP, BTN_PROJ_BLANK])
         {
             send_string dvProjector, "'~0011 0', $0D"
@@ -512,6 +635,57 @@ button_event[dvTP, BTN_PROJ_BLANK]
             send_string dvProjector, "'~0011 1', $0D"
             on[dvTP, BTN_PROJ_BLANK]
         }
+    }
+}
+
+(* --------------------------------------------------------*)
+(* TOUCH PANEL -- ONLINE / OFFLINE                         *)
+(* --------------------------------------------------------*)
+data_event[dvTP]
+{
+    online:
+    {
+        send_string 0, "'dvTP ONLINE -- touch panel connected'"
+        // Re-sync UI state on panel reconnect
+        if (nProjectorPower)
+        {
+            on[dvTP, BTN_PROJ_PWR_ON]
+            send_command dvTP, "'^ANI-20,3,3,0'"
+            on[dvTP, BTN_SYS_POWER_ON]
+            send_command dvTP, "'^ANI-1,3,3,0'"
+            send_command dvTP, "'^ENA-22,1'"
+            send_command dvTP, "'^ENA-23,1'"
+            send_command dvTP, "'^ENA-24,1'"
+            send_command dvTP, "'^ENA-25,1'"
+            send_command dvTP, "'^ENA-26,1'"
+            send_command dvTP, "'^TXT-200,0,Projector ON'"
+            send_command dvTP, "'^CFT-200,0,2,#2ECC71'"
+        }
+        else
+        {
+            off[dvTP, BTN_PROJ_PWR_ON]
+            send_command dvTP, "'^ANI-20,1,1,0'"
+            off[dvTP, BTN_SYS_POWER_ON]
+            send_command dvTP, "'^ANI-1,1,1,0'"
+            send_command dvTP, "'^ENA-22,0'"
+            send_command dvTP, "'^ENA-23,0'"
+            send_command dvTP, "'^ENA-24,0'"
+            send_command dvTP, "'^ENA-25,0'"
+            send_command dvTP, "'^ENA-26,0'"
+            send_command dvTP, "'^TXT-200,0,System OFF'"
+            send_command dvTP, "'^CFT-200,0,2,#E74C3C'"
+        }
+
+        if (nCommFault)
+        {
+            send_command dvTP, "'^TXT-200,0,COMM FAULT - No Response'"
+            send_command dvTP, "'^CFT-200,0,2,#9B59B6'"
+        }
+    }
+
+    offline:
+    {
+        send_string 0, "'WARNING: dvTP OFFLINE -- touch panel disconnected'"
     }
 }
 
