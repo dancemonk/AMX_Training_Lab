@@ -12,11 +12,13 @@ PROGRAM_NAME='MasterCode'
 (* v2.3 - Fixed state machine: consistent on[]/off[] + ANI *)
 (* v2.4 - Code review pass                                 *)
 (* v2.5 - Fixed State Bounce / Race Condition on Power     *)
-(* Removed premature wait 30 / wait 50 polling.     *)
-(* Restored sProjRxBuffer for safe string parsing.  *)
+(*        Removed premature wait 30 / wait 50 polling.     *)
+(*        Restored sProjRxBuffer for safe string parsing.  *)
 (* v2.6 - Fixed Disabled Gray Mask Glitch.                 *)
-(* Changed ^ENA-21,0 to ^ENA-21,1 in all states to  *)
-(* allow custom colors to show during transitions.  *)
+(*        Changed ^ENA-21,0 to ^ENA-21,1 in all states to  *)
+(*        allow custom colors to show during transitions.  *)
+(* v3.0 - Refactored duplicate UI patterns into shared     *)
+(*        utility functions.                               *)
 (***********************************************************)
 
 (***********************************************************)
@@ -59,6 +61,14 @@ BTN_NAV_DISPLAY         = 102
 BTN_NAV_AUDIO           = 103
 BTN_NAV_PRESETS         = 104
 
+(* --------------------------------------------------------*)
+(* PROJECTOR UI STATES                                     *)
+(* --------------------------------------------------------*)
+PROJ_STATE_OFF          = 1
+PROJ_STATE_WARMING      = 2
+PROJ_STATE_ON           = 3
+PROJ_STATE_COOLING      = 4
+
 (***********************************************************)
 (* VARIABLE DEFINITIONS                     *)
 (***********************************************************)
@@ -73,41 +83,132 @@ volatile long lHeartbeat[] = {30000}   // 30 second heartbeat
 volatile char sProjRxBuffer[100]
 
 (***********************************************************)
+(* SHARED UTILITY FUNCTIONS                                *)
+(***********************************************************)
+
+(* --------------------------------------------------------*)
+(* fnSetButtonFeedback                                     *)
+(* Sets a button's channel feedback and animation state.   *)
+(* --------------------------------------------------------*)
+DEFINE_FUNCTION fnSetButtonFeedback(DEV dvPanel, INTEGER nButton, INTEGER nFeedbackOn, INTEGER nAniState)
+{
+    if (nFeedbackOn)
+        on[dvPanel, nButton]
+    else
+        off[dvPanel, nButton]
+    send_command dvPanel, "'^ANI-', itoa(nButton), ',', itoa(nAniState), ',', itoa(nAniState), ',0'"
+    send_command dvPanel, "'^ENA-', itoa(nButton), ',1'"
+}
+
+(* --------------------------------------------------------*)
+(* fnEnableInputButtons                                    *)
+(* Enables (1) or disables (0) all input/control buttons.  *)
+(* --------------------------------------------------------*)
+DEFINE_FUNCTION fnEnableInputButtons(DEV dvPanel, INTEGER nEnable)
+{
+    send_command dvPanel, "'^ENA-22,', itoa(nEnable)"
+    send_command dvPanel, "'^ENA-23,', itoa(nEnable)"
+    send_command dvPanel, "'^ENA-24,', itoa(nEnable)"
+    send_command dvPanel, "'^ENA-25,', itoa(nEnable)"
+    send_command dvPanel, "'^ENA-26,', itoa(nEnable)"
+}
+
+(* --------------------------------------------------------*)
+(* fnUpdateStatusBar                                       *)
+(* Sets the status bar text and font color.                *)
+(* --------------------------------------------------------*)
+DEFINE_FUNCTION fnUpdateStatusBar(DEV dvPanel, CHAR sText[], CHAR sColor[])
+{
+    send_command dvPanel, "'^TXT-200,0,', sText"
+    send_command dvPanel, "'^CFT-200,0,2,', sColor"
+}
+
+(* --------------------------------------------------------*)
+(* fnSetProjectorUI                                        *)
+(* Applies a complete projector UI state to the touch      *)
+(* panel: power button feedback, input button enables,     *)
+(* and status bar.                                         *)
+(* --------------------------------------------------------*)
+DEFINE_FUNCTION fnSetProjectorUI(INTEGER nState, CHAR sStatusText[], CHAR sStatusColor[])
+{
+    switch (nState)
+    {
+        case PROJ_STATE_OFF:
+        {
+            fnSetButtonFeedback(dvTP, BTN_PROJ_PWR_ON,  0, 1)
+            fnSetButtonFeedback(dvTP, BTN_PROJ_PWR_OFF, 0, 1)
+            fnSetButtonFeedback(dvTP, BTN_SYS_POWER_ON, 0, 1)
+            fnEnableInputButtons(dvTP, 0)
+        }
+        case PROJ_STATE_WARMING:
+        {
+            fnSetButtonFeedback(dvTP, BTN_PROJ_PWR_ON,  1, 2)
+            fnSetButtonFeedback(dvTP, BTN_PROJ_PWR_OFF, 0, 3)
+            fnSetButtonFeedback(dvTP, BTN_SYS_POWER_ON, 1, 2)
+            fnEnableInputButtons(dvTP, 0)
+        }
+        case PROJ_STATE_ON:
+        {
+            fnSetButtonFeedback(dvTP, BTN_PROJ_PWR_ON,  1, 3)
+            fnSetButtonFeedback(dvTP, BTN_PROJ_PWR_OFF, 0, 3)
+            fnSetButtonFeedback(dvTP, BTN_SYS_POWER_ON, 1, 3)
+            fnEnableInputButtons(dvTP, 1)
+        }
+        case PROJ_STATE_COOLING:
+        {
+            fnSetButtonFeedback(dvTP, BTN_PROJ_PWR_ON,  0, 1)
+            fnSetButtonFeedback(dvTP, BTN_PROJ_PWR_OFF, 1, 2)
+            fnSetButtonFeedback(dvTP, BTN_SYS_POWER_ON, 1, 2)
+            fnEnableInputButtons(dvTP, 0)
+        }
+    }
+    fnUpdateStatusBar(dvTP, sStatusText, sStatusColor)
+}
+
+(* --------------------------------------------------------*)
+(* fnSelectInput                                           *)
+(* Sends the input-select command and applies mutual-      *)
+(* exclusive feedback on the three input buttons.          *)
+(* --------------------------------------------------------*)
+DEFINE_FUNCTION fnSelectInput(CHAR sInputCmd[], INTEGER nActiveBtn)
+{
+    send_string dvProjector, "sInputCmd, $0D"
+    [dvTP, BTN_INP_HDMI]  = (nActiveBtn == BTN_INP_HDMI)
+    [dvTP, BTN_INP_VGA]   = (nActiveBtn == BTN_INP_VGA)
+    [dvTP, BTN_INP_HDMI2] = (nActiveBtn == BTN_INP_HDMI2)
+}
+
+(* --------------------------------------------------------*)
+(* fnToggleFeature                                         *)
+(* Toggles a projector feature (freeze / blank) and        *)
+(* updates button feedback.                                *)
+(* --------------------------------------------------------*)
+DEFINE_FUNCTION fnToggleFeature(INTEGER nButton, CHAR sOnCmd[], CHAR sOffCmd[])
+{
+    if ([dvTP, nButton])
+    {
+        send_string dvProjector, "sOffCmd, $0D"
+        off[dvTP, nButton]
+    }
+    else
+    {
+        send_string dvProjector, "sOnCmd, $0D"
+        on[dvTP, nButton]
+    }
+}
+
+(***********************************************************)
 (* STARTUP CODE                        *)
 (***********************************************************)
 DEFINE_START
 
-send_string 0, "'SYSTEM STARTED v2.6'"
+send_string 0, "'SYSTEM STARTED v3.0'"
 
 // Configure RS-232 port 4
 send_command dvProjector, "'SET BAUD 9600 N 8 1'"
 send_command dvProjector, "'CLEAR_FAULT'"
 
-// STATE: PROJECTOR OFF
-// ON button  -> GRAY (State 1)
-off[dvTP, BTN_PROJ_PWR_ON]
-send_command dvTP, "'^ANI-20,1,1,0'"
-send_command dvTP, "'^ENA-20,1'"
-
-// OFF button -> RED (State 1) -- Guard variables prevent firing
-off[dvTP, BTN_PROJ_PWR_OFF]
-send_command dvTP, "'^ANI-21,1,1,0'"
-send_command dvTP, "'^ENA-21,1'" // [cite: 302] Let native red color show
-
-// HOME button -> GRAY (State 1)
-off[dvTP, BTN_SYS_POWER_ON]
-send_command dvTP, "'^ANI-1,1,1,0'"
-
-// Disable all input and control buttons on boot
-send_command dvTP, "'^ENA-22,0'"
-send_command dvTP, "'^ENA-23,0'"
-send_command dvTP, "'^ENA-24,0'"
-send_command dvTP, "'^ENA-25,0'"
-send_command dvTP, "'^ENA-26,0'"
-
-// Status bar
-send_command dvTP, "'^TXT-200,0,System OFF'"
-send_command dvTP, "'^CFT-200,0,2,#E74C3C'"
+fnSetProjectorUI(PROJ_STATE_OFF, 'System OFF', '#E74C3C')
 
 // Start heartbeat -- polls projector every 30 seconds
 timeline_create(1, lHeartbeat, 1, TIMELINE_RELATIVE, TIMELINE_REPEAT)
@@ -157,30 +258,7 @@ data_event[dvProjector]
             {
                 nProjectorPower = 1
                 nSystemPower    = 1
-
-                // ON button  -> GREEN (State 3)
-                on[dvTP, BTN_PROJ_PWR_ON]
-                send_command dvTP, "'^ANI-20,3,3,0'"
-                send_command dvTP, "'^ENA-20,1'"
-
-                // OFF button -> GRAY (State 3) 
-                off[dvTP, BTN_PROJ_PWR_OFF]
-                send_command dvTP, "'^ANI-21,3,3,0'"
-                send_command dvTP, "'^ENA-21,1'"
-
-                // HOME button -> GREEN (State 3)
-                on[dvTP, BTN_SYS_POWER_ON]
-                send_command dvTP, "'^ANI-1,3,3,0'"
-
-                // Enable input and control buttons
-                send_command dvTP, "'^ENA-22,1'"
-                send_command dvTP, "'^ENA-23,1'"
-                send_command dvTP, "'^ENA-24,1'"
-                send_command dvTP, "'^ENA-25,1'"
-                send_command dvTP, "'^ENA-26,1'"
-
-                send_command dvTP, "'^TXT-200,0,Projector ON'"
-                send_command dvTP, "'^CFT-200,0,2,#2ECC71'"
+                fnSetProjectorUI(PROJ_STATE_ON, 'Projector ON', '#2ECC71')
                 send_string 0, "'Projector confirmed: ON'"
             }
 
@@ -189,88 +267,21 @@ data_event[dvProjector]
             {
                 nProjectorPower = 0
                 nSystemPower    = 0
-
-                // ON button  -> GRAY (State 1)
-                off[dvTP, BTN_PROJ_PWR_ON]
-                send_command dvTP, "'^ANI-20,1,1,0'"
-                send_command dvTP, "'^ENA-20,1'"
-
-                // OFF button -> RED (State 1)
-                off[dvTP, BTN_PROJ_PWR_OFF]
-                send_command dvTP, "'^ANI-21,1,1,0'"
-                send_command dvTP, "'^ENA-21,1'" // [cite: 302] Let native red color show
-
-                // HOME button -> GRAY (State 1)
-                off[dvTP, BTN_SYS_POWER_ON]
-                send_command dvTP, "'^ANI-1,1,1,0'"
-
-                // Disable input and control buttons
-                send_command dvTP, "'^ENA-22,0'"
-                send_command dvTP, "'^ENA-23,0'"
-                send_command dvTP, "'^ENA-24,0'"
-                send_command dvTP, "'^ENA-25,0'"
-                send_command dvTP, "'^ENA-26,0'"
-
-                send_command dvTP, "'^TXT-200,0,System OFF'"
-                send_command dvTP, "'^CFT-200,0,2,#E74C3C'"
+                fnSetProjectorUI(PROJ_STATE_OFF, 'System OFF', '#E74C3C')
                 send_string 0, "'Projector confirmed: OFF'"
             }
 
             // --- WARMING UP ---
             else if (find_string(sCurrentMessage, 'INFO1', 1))
             {
-                // ON button  -> AMBER (State 2)
-                on[dvTP, BTN_PROJ_PWR_ON]
-                send_command dvTP, "'^ANI-20,2,2,0'"
-                send_command dvTP, "'^ENA-20,1'" // [cite: 302] Let amber color show
-
-                // OFF button -> GRAY (State 3) 
-                off[dvTP, BTN_PROJ_PWR_OFF]
-                send_command dvTP, "'^ANI-21,3,3,0'"
-                send_command dvTP, "'^ENA-21,1'" // [cite: 302] Guard variables prevent push
-
-                // HOME button -> AMBER (State 2)
-                on[dvTP, BTN_SYS_POWER_ON]
-                send_command dvTP, "'^ANI-1,2,2,0'"
-
-                // Disable input and control buttons
-                send_command dvTP, "'^ENA-22,0'"
-                send_command dvTP, "'^ENA-23,0'"
-                send_command dvTP, "'^ENA-24,0'"
-                send_command dvTP, "'^ENA-25,0'"
-                send_command dvTP, "'^ENA-26,0'"
-
-                send_command dvTP, "'^TXT-200,0,Projector Warming Up'"
-                send_command dvTP, "'^CFT-200,0,2,#F39C12'"
+                fnSetProjectorUI(PROJ_STATE_WARMING, 'Projector Warming Up', '#F39C12')
                 send_string 0, "'INFO1 received -- projector warming up'"
             }
 
             // --- COOLING DOWN ---
             else if (find_string(sCurrentMessage, 'INFO2', 1))
             {
-                // ON button  -> GRAY (State 1)
-                off[dvTP, BTN_PROJ_PWR_ON]
-                send_command dvTP, "'^ANI-20,1,1,0'"
-                send_command dvTP, "'^ENA-20,1'"
-
-                // OFF button -> DIMMED GREEN (State 2) 
-                on[dvTP, BTN_PROJ_PWR_OFF]
-                send_command dvTP, "'^ANI-21,2,2,0'"
-                send_command dvTP, "'^ENA-21,1'" // [cite: 302] Let dim green color show
-
-                // HOME button -> AMBER (State 2)
-                on[dvTP, BTN_SYS_POWER_ON]
-                send_command dvTP, "'^ANI-1,2,2,0'"
-
-                // Disable input and control buttons
-                send_command dvTP, "'^ENA-22,0'"
-                send_command dvTP, "'^ENA-23,0'"
-                send_command dvTP, "'^ENA-24,0'"
-                send_command dvTP, "'^ENA-25,0'"
-                send_command dvTP, "'^ENA-26,0'"
-
-                send_command dvTP, "'^TXT-200,0,Projector Cooling Down'"
-                send_command dvTP, "'^CFT-200,0,2,#F39C12'"
+                fnSetProjectorUI(PROJ_STATE_COOLING, 'Projector Cooling Down', '#F39C12')
                 send_string 0, "'Projector cooling down (INFO2)'"
             }
 
@@ -292,65 +303,15 @@ button_event[dvTP, BTN_SYS_POWER_ON]
     {
         if (nSystemPower == 0)
         {
-            // TURN ON -- show WARMING state immediately
             send_string dvProjector, "'~0000 1', $0D"
-
-            // ON button  -> AMBER (State 2)
-            on[dvTP, BTN_PROJ_PWR_ON]
-            send_command dvTP, "'^ANI-20,2,2,0'"
-            send_command dvTP, "'^ENA-20,1'" // [cite: 303]
-
-            // OFF button -> GRAY (State 3) 
-            off[dvTP, BTN_PROJ_PWR_OFF]
-            send_command dvTP, "'^ANI-21,3,3,0'"
-            send_command dvTP, "'^ENA-21,1'" // [cite: 303]
-
-            // HOME button -> AMBER (State 2)
-            on[dvTP, BTN_SYS_POWER_ON]
-            send_command dvTP, "'^ANI-1,2,2,0'"
-
-            // Disable input and control buttons
-            send_command dvTP, "'^ENA-22,0'"
-            send_command dvTP, "'^ENA-23,0'"
-            send_command dvTP, "'^ENA-24,0'"
-            send_command dvTP, "'^ENA-25,0'"
-            send_command dvTP, "'^ENA-26,0'"
-
-            send_command dvTP, "'^TXT-200,0,Projector Starting...'"
-            send_command dvTP, "'^CFT-200,0,2,#F39C12'"
-
+            fnSetProjectorUI(PROJ_STATE_WARMING, 'Projector Starting...', '#F39C12')
             nSystemPower    = 1
             nProjectorPower = 1
         }
         else
         {
-            // TURN OFF -- show COOLING state immediately
             send_string dvProjector, "'~0000 0', $0D"
-
-            // ON button  -> GRAY (State 1)
-            off[dvTP, BTN_PROJ_PWR_ON]
-            send_command dvTP, "'^ANI-20,1,1,0'"
-            send_command dvTP, "'^ENA-20,1'" // [cite: 303]
-
-            // OFF button -> DIMMED GREEN (State 2) 
-            on[dvTP, BTN_PROJ_PWR_OFF]
-            send_command dvTP, "'^ANI-21,2,2,0'"
-            send_command dvTP, "'^ENA-21,1'" // [cite: 303]
-
-            // HOME button -> AMBER (State 2)
-            on[dvTP, BTN_SYS_POWER_ON]
-            send_command dvTP, "'^ANI-1,2,2,0'"
-
-            // Disable input and control buttons
-            send_command dvTP, "'^ENA-22,0'"
-            send_command dvTP, "'^ENA-23,0'"
-            send_command dvTP, "'^ENA-24,0'"
-            send_command dvTP, "'^ENA-25,0'"
-            send_command dvTP, "'^ENA-26,0'"
-
-            send_command dvTP, "'^TXT-200,0,Projector Shutting Down...'"
-            send_command dvTP, "'^CFT-200,0,2,#F39C12'"
-
+            fnSetProjectorUI(PROJ_STATE_COOLING, 'Projector Shutting Down...', '#F39C12')
             nSystemPower    = 0
             nProjectorPower = 0
         }
@@ -367,31 +328,7 @@ button_event[dvTP, BTN_PROJ_PWR_ON]
         if (nProjectorPower == 0)
         {
             send_string dvProjector, "'~0000 1', $0D"
-
-            // ON button  -> AMBER (State 2)
-            on[dvTP, BTN_PROJ_PWR_ON]
-            send_command dvTP, "'^ANI-20,2,2,0'"
-            send_command dvTP, "'^ENA-20,1'" // [cite: 303]
-
-            // OFF button -> GRAY (State 3)
-            off[dvTP, BTN_PROJ_PWR_OFF]
-            send_command dvTP, "'^ANI-21,3,3,0'"
-            send_command dvTP, "'^ENA-21,1'" // [cite: 303]
-
-            // HOME button -> AMBER (State 2)
-            on[dvTP, BTN_SYS_POWER_ON]
-            send_command dvTP, "'^ANI-1,2,2,0'"
-
-            // Disable input and control buttons
-            send_command dvTP, "'^ENA-22,0'"
-            send_command dvTP, "'^ENA-23,0'"
-            send_command dvTP, "'^ENA-24,0'"
-            send_command dvTP, "'^ENA-25,0'"
-            send_command dvTP, "'^ENA-26,0'"
-
-            send_command dvTP, "'^TXT-200,0,Projector Starting...'"
-            send_command dvTP, "'^CFT-200,0,2,#F39C12'"
-
+            fnSetProjectorUI(PROJ_STATE_WARMING, 'Projector Starting...', '#F39C12')
             nProjectorPower = 1
             nSystemPower    = 1
         }
@@ -408,31 +345,7 @@ button_event[dvTP, BTN_PROJ_PWR_OFF]
         if (nProjectorPower == 1)
         {
             send_string dvProjector, "'~0000 0', $0D"
-
-            // ON button  -> GRAY (State 1)
-            off[dvTP, BTN_PROJ_PWR_ON]
-            send_command dvTP, "'^ANI-20,1,1,0'"
-            send_command dvTP, "'^ENA-20,1'" // [cite: 303]
-
-            // OFF button -> DIMMED GREEN (State 2) 
-            on[dvTP, BTN_PROJ_PWR_OFF]
-            send_command dvTP, "'^ANI-21,2,2,0'"
-            send_command dvTP, "'^ENA-21,1'" // [cite: 303]
-
-            // HOME button -> AMBER (State 2)
-            on[dvTP, BTN_SYS_POWER_ON]
-            send_command dvTP, "'^ANI-1,2,2,0'"
-
-            // Disable input and control buttons
-            send_command dvTP, "'^ENA-22,0'"
-            send_command dvTP, "'^ENA-23,0'"
-            send_command dvTP, "'^ENA-24,0'"
-            send_command dvTP, "'^ENA-25,0'"
-            send_command dvTP, "'^ENA-26,0'"
-
-            send_command dvTP, "'^TXT-200,0,Projector Shutting Down...'"
-            send_command dvTP, "'^CFT-200,0,2,#F39C12'"
-
+            fnSetProjectorUI(PROJ_STATE_COOLING, 'Projector Shutting Down...', '#F39C12')
             nProjectorPower = 0
             nSystemPower    = 0
         }
@@ -444,35 +357,17 @@ button_event[dvTP, BTN_PROJ_PWR_OFF]
 (* --------------------------------------------------------*)
 button_event[dvTP, BTN_INP_HDMI]
 {
-    push:
-    {
-        send_string dvProjector, "'~0012 5', $0D"
-        on[dvTP,  BTN_INP_HDMI]
-        off[dvTP, BTN_INP_VGA]
-        off[dvTP, BTN_INP_HDMI2]
-    }
+    push: { fnSelectInput("'~0012 5'", BTN_INP_HDMI) }
 }
 
 button_event[dvTP, BTN_INP_VGA]
 {
-    push:
-    {
-        send_string dvProjector, "'~0012 1', $0D"
-        off[dvTP, BTN_INP_HDMI]
-        on[dvTP,  BTN_INP_VGA]
-        off[dvTP, BTN_INP_HDMI2]
-    }
+    push: { fnSelectInput("'~0012 1'", BTN_INP_VGA) }
 }
 
 button_event[dvTP, BTN_INP_HDMI2]
 {
-    push:
-    {
-        send_string dvProjector, "'~0012 6', $0D"
-        off[dvTP, BTN_INP_HDMI]
-        off[dvTP, BTN_INP_VGA]
-        on[dvTP,  BTN_INP_HDMI2]
-    }
+    push: { fnSelectInput("'~0012 6'", BTN_INP_HDMI2) }
 }
 
 (* --------------------------------------------------------*)
@@ -480,19 +375,7 @@ button_event[dvTP, BTN_INP_HDMI2]
 (* --------------------------------------------------------*)
 button_event[dvTP, BTN_PROJ_FREEZE]
 {
-    push:
-    {
-        if ([dvTP, BTN_PROJ_FREEZE])
-        {
-            send_string dvProjector, "'~0080 0', $0D"
-            off[dvTP, BTN_PROJ_FREEZE]
-        }
-        else
-        {
-            send_string dvProjector, "'~0080 1', $0D"
-            on[dvTP, BTN_PROJ_FREEZE]
-        }
-    }
+    push: { fnToggleFeature(BTN_PROJ_FREEZE, "'~0080 1'", "'~0080 0'") }
 }
 
 (* --------------------------------------------------------*)
@@ -500,19 +383,7 @@ button_event[dvTP, BTN_PROJ_FREEZE]
 (* --------------------------------------------------------*)
 button_event[dvTP, BTN_PROJ_BLANK]
 {
-    push:
-    {
-        if ([dvTP, BTN_PROJ_BLANK])
-        {
-            send_string dvProjector, "'~0011 0', $0D"
-            off[dvTP, BTN_PROJ_BLANK]
-        }
-        else
-        {
-            send_string dvProjector, "'~0011 1', $0D"
-            on[dvTP, BTN_PROJ_BLANK]
-        }
-    }
+    push: { fnToggleFeature(BTN_PROJ_BLANK, "'~0011 1'", "'~0011 0'") }
 }
 
 (* --------------------------------------------------------*)
