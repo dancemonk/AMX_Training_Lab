@@ -4,3 +4,5 @@
 *.BAK
 *.~* # Temporary editor files
 *.log      # Local diagnostic logs
+__pycache__/
+.pytest_cache/
