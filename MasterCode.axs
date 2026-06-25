@@ -24,7 +24,7 @@ PROGRAM_NAME='MasterCode'
 (***********************************************************)
 DEFINE_DEVICE
 
-// AMX MXT-1001 G5 Touch Panel -- 192.168.21.12
+// AMX MXT-1001 G5 Touch Panel
 dvTP            = 10001:1:0
 
 // Optoma EH415E Projector -- RS-232 -- NX-3200 Port 4
@@ -66,17 +66,21 @@ DEFINE_VARIABLE
 
 volatile integer nSystemPower       // 0=off, 1=on
 volatile integer nProjectorPower    // 0=off, 1=on
+volatile integer nDebugMode         // 0=off (production), 1=on (diagnostics)
 
 volatile long lHeartbeat[] = {30000}   // 30 second heartbeat
 
+constant integer MAX_PROJ_RX_BUFFER = 100
+
 // Buffer for parsing serial RS-232 messages safely
-volatile char sProjRxBuffer[100]
+volatile char sProjRxBuffer[MAX_PROJ_RX_BUFFER]
 
 (***********************************************************)
 (* STARTUP CODE                        *)
 (***********************************************************)
 DEFINE_START
 
+nDebugMode = 0  // Set to 1 only for on-site diagnostics
 send_string 0, "'SYSTEM STARTED v2.6'"
 
 // Configure RS-232 port 4
@@ -123,7 +127,7 @@ DEFINE_EVENT
 timeline_event[1]
 {
     send_string dvProjector, "'~00124 1', $0D"
-    send_string 0, "'Heartbeat - status query sent'"
+    if (nDebugMode) { send_string 0, "'Heartbeat - status query sent'" }
 }
 
 (* --------------------------------------------------------*)
@@ -135,16 +139,24 @@ data_event[dvProjector]
     {
         send_command dvProjector, "'SET BAUD 9600 N 8 1'"
         send_command dvProjector, "'CLEAR_FAULT'"
-        send_string 0, "'dvProjector ONLINE -- RS-232 re-initialized'"
+        if (nDebugMode) { send_string 0, "'dvProjector ONLINE -- RS-232 re-initialized'" }
         wait 10 { send_string dvProjector, "'~00124 1', $0D" }
     }
 
     string:
     {
-        send_string 0, "'RAW: [', data.text, ']'"
+        if (nDebugMode) { send_string 0, "'RAW: [', data.text, ']'" }
         
-        // Append raw data into our parsing buffer
-        sProjRxBuffer = "sProjRxBuffer, data.text"
+        // Append raw data into our parsing buffer (with overflow guard)
+        if (length_string(sProjRxBuffer) + length_string(data.text) <= MAX_PROJ_RX_BUFFER)
+        {
+            sProjRxBuffer = "sProjRxBuffer, data.text"
+        }
+        else
+        {
+            send_string 0, "'WARNING: RX buffer overflow -- flushing'"
+            sProjRxBuffer = ''
+        }
         
         // Loop through buffer to catch EVERY response separated by Carriage Return ($0D)
         while (find_string(sProjRxBuffer, "$0D", 1))
@@ -181,7 +193,7 @@ data_event[dvProjector]
 
                 send_command dvTP, "'^TXT-200,0,Projector ON'"
                 send_command dvTP, "'^CFT-200,0,2,#2ECC71'"
-                send_string 0, "'Projector confirmed: ON'"
+                if (nDebugMode) { send_string 0, "'Projector confirmed: ON'" }
             }
 
             // --- PROJECTOR OFF ---
@@ -213,7 +225,7 @@ data_event[dvProjector]
 
                 send_command dvTP, "'^TXT-200,0,System OFF'"
                 send_command dvTP, "'^CFT-200,0,2,#E74C3C'"
-                send_string 0, "'Projector confirmed: OFF'"
+                if (nDebugMode) { send_string 0, "'Projector confirmed: OFF'" }
             }
 
             // --- WARMING UP ---
@@ -242,7 +254,7 @@ data_event[dvProjector]
 
                 send_command dvTP, "'^TXT-200,0,Projector Warming Up'"
                 send_command dvTP, "'^CFT-200,0,2,#F39C12'"
-                send_string 0, "'INFO1 received -- projector warming up'"
+                if (nDebugMode) { send_string 0, "'INFO1 received -- projector warming up'" }
             }
 
             // --- COOLING DOWN ---
@@ -271,13 +283,13 @@ data_event[dvProjector]
 
                 send_command dvTP, "'^TXT-200,0,Projector Cooling Down'"
                 send_command dvTP, "'^CFT-200,0,2,#F39C12'"
-                send_string 0, "'Projector cooling down (INFO2)'"
+                if (nDebugMode) { send_string 0, "'Projector cooling down (INFO2)'" }
             }
 
             // --- COMMAND ACCEPTED (P ACK) ---
             else if (find_string(sCurrentMessage, 'P', 1))
             {
-                send_string 0, "'Command accepted (P)'"
+                if (nDebugMode) { send_string 0, "'Command accepted (P)'" }
             }
         }
     }
