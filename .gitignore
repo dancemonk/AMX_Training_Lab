@@ -3,4 +3,4 @@
 *.bak      # NetLinx Studio Backup files
 *.BAK
 *.~* # Temporary editor files
-*.log      # Local diagnostic logs
+*.log      # Local diagnostic logs__pycache__/
