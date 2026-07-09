@@ -1,6 +1,36 @@
-# AMX NetLinx Ignore List
-*.tko      # Compiled NetLinx Token files
-*.bak      # NetLinx Studio Backup files
-*.BAK
-*.~* # Temporary editor files
-*.log      # Local diagnostic logs
+# --------------------------------------------------------
+# AMX NetLinx Studio Build Artifacts
+# --------------------------------------------------------
+# Compiled Token Files (Deployed to Master, do not track)
+*.tkn
+
+# Compiler Logs and Error Output
+*.err
+*.log
+*.map
+
+# --------------------------------------------------------
+# Editor Backups and Temporary Files
+# --------------------------------------------------------
+# NetLinx Studio auto-save backups
+*.bak
+*.bak*
+
+# Temporary cache files
+*.tmp
+*~
+~*.*
+
+# --------------------------------------------------------
+# Operating System Files
+# --------------------------------------------------------
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# macOS (if transferring files via USB/Network from Mac)
+.DS_Store
+.AppleDouble
+.LSOverride
